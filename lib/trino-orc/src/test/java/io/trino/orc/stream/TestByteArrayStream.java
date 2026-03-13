@@ -13,12 +13,14 @@
  */
 package io.trino.orc.stream;
 
+import io.airlift.slice.DynamicSliceOutput;
 import io.airlift.slice.Slice;
 import io.airlift.slice.SliceOutput;
 import io.airlift.slice.Slices;
 import io.trino.orc.OrcCorruptionException;
 import io.trino.orc.OrcDecompressor;
 import io.trino.orc.checkpoint.ByteArrayStreamCheckpoint;
+import io.trino.orc.metadata.OrcColumnId;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -28,7 +30,11 @@ import java.util.Optional;
 
 import static io.trino.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
 import static io.trino.orc.OrcDecompressor.createOrcDecompressor;
+import static io.trino.orc.checkpoint.InputStreamCheckpoint.decodeCompressedBlockOffset;
+import static io.trino.orc.checkpoint.InputStreamCheckpoint.decodeDecompressedOffset;
 import static io.trino.orc.metadata.CompressionKind.SNAPPY;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
 public class TestByteArrayStream
         extends AbstractTestValueStream<Slice, ByteArrayStreamCheckpoint, ByteArrayOutputStream, ByteArrayInputStream>
@@ -50,6 +56,36 @@ public class TestByteArrayStream
             groups.add(group);
         }
         testWriteValue(groups);
+    }
+
+    @Test
+    public void testSeekToCheckpointAtCompressedStreamEnd()
+            throws IOException
+    {
+        ByteArrayOutputStream outputStream = createValueOutputStream();
+
+        outputStream.recordCheckpoint();
+        Slice largeValue = Slices.allocate(40_000);
+        outputStream.writeSlice(largeValue);
+        outputStream.writeSlice(largeValue);
+
+        // Record an empty trailing group, so its checkpoint points at EOF.
+        outputStream.recordCheckpoint();
+        outputStream.close();
+
+        List<ByteArrayStreamCheckpoint> checkpoints = outputStream.getCheckpoints();
+        assertThat(checkpoints).hasSize(2);
+
+        DynamicSliceOutput sliceOutput = new DynamicSliceOutput(1000);
+        StreamDataOutput streamDataOutput = outputStream.getStreamDataOutput(new OrcColumnId(33));
+        streamDataOutput.writeData(sliceOutput);
+
+        long emptyGroupCheckpoint = checkpoints.get(1).getInputStreamCheckpoint();
+        assertThat(decodeCompressedBlockOffset(emptyGroupCheckpoint)).isEqualTo(streamDataOutput.getStream().getLength());
+        assertThat(decodeDecompressedOffset(emptyGroupCheckpoint)).isZero();
+
+        ByteArrayInputStream valueStream = createValueStream(sliceOutput.slice());
+        assertThatCode(() -> valueStream.seekToCheckpoint(checkpoints.get(1))).doesNotThrowAnyException();
     }
 
     @Override
